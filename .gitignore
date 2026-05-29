@@ -1,0 +1,8 @@
+.DS_Store
+.build/
+*.xcodeproj
+*.swiftpm
+.swiftpm/
+Package.resolved
+/RESULT.md
+dist/
