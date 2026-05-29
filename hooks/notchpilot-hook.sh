@@ -93,11 +93,13 @@ try:
     state.setdefault("project", state.get("project"))
     state.setdefault("status", "idle")
     state.setdefault("statusDetail", None)
+    state.setdefault("needsPermission", False)
     state.setdefault("tty", None)
     state.setdefault("termSessionId", None)
     state.setdefault("model", None)
     state.setdefault("startedAt", None)
     state.setdefault("turnStartedAt", None)
+    state.setdefault("contextTokens", None)
 
     # --- Subagent / parent-child linkage (DEFENSIVE, optional) -----------------
     # The public Claude Code hook schema does NOT currently document a reliable
@@ -126,6 +128,62 @@ try:
     tp_path = data.get("transcript_path")
     if isinstance(tp_path, str) and tp_path:
         state["transcriptPath"] = tp_path
+
+    # --- Context-window usage (DEFENSIVE, optional) ----------------------------
+    # Compute how full the model's context window is by reading the session's
+    # transcript .jsonl and finding the MOST RECENT assistant turn's `usage`. The
+    # prompt/context size for a turn ≈ input_tokens + cache_read_input_tokens +
+    # cache_creation_input_tokens. PERFORMANCE: we only read the TAIL of the file
+    # (last ~256KB) and scan lines from the END for the first object carrying a
+    # `usage` with token fields, so this stays fast + non-blocking even on huge
+    # transcripts. Any failure is swallowed — we leave the prior value intact and
+    # never break or slow the hook.
+    def compute_context_tokens(path):
+        try:
+            tp = os.path.expanduser(path)
+            size = os.path.getsize(tp)
+            tail = 256 * 1024
+            with open(tp, "rb") as f:
+                if size > tail:
+                    f.seek(size - tail)
+                    f.readline()  # discard the partial first line after the seek
+                chunk = f.read()
+            text = chunk.decode("utf-8", "replace")
+            for line in reversed(text.splitlines()):
+                line = line.strip()
+                if not line or "usage" not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                msg = obj.get("message")
+                usage = None
+                if isinstance(msg, dict) and isinstance(msg.get("usage"), dict):
+                    usage = msg["usage"]
+                elif isinstance(obj.get("usage"), dict):
+                    usage = obj["usage"]
+                if not isinstance(usage, dict):
+                    continue
+                total = 0
+                for k in ("input_tokens", "cache_read_input_tokens",
+                          "cache_creation_input_tokens"):
+                    v = usage.get(k)
+                    if isinstance(v, (int, float)):
+                        total += int(v)
+                if total > 0:
+                    return total
+        except Exception:
+            return None
+        return None
+
+    tp_for_ctx = state.get("transcriptPath")
+    if isinstance(tp_for_ctx, str) and tp_for_ctx:
+        ctx = compute_context_tokens(tp_for_ctx)
+        if isinstance(ctx, int) and ctx > 0:
+            state["contextTokens"] = ctx
 
     # Remember the status BEFORE this event so we can detect the start of a turn.
     prev_status = state.get("status")
@@ -174,6 +232,7 @@ try:
     # Event -> status mapping (per STATE_SCHEMA.md). status only changes here.
     if event == "SessionStart":
         state["status"] = "idle"
+        state["needsPermission"] = False
         # Capture startedAt once; tty/termSessionId are handled by the backfill above.
         if not state.get("startedAt"):
             state["startedAt"] = now_iso()
@@ -187,21 +246,33 @@ try:
     elif event == "UserPromptSubmit":
         state["status"] = "working"
         state["statusDetail"] = "thinking…"
+        state["needsPermission"] = False
 
     elif event == "PreToolUse":
         state["status"] = "working"
+        state["needsPermission"] = False
         tool_name = data.get("tool_name") or "tool"
         tgt = short_target(tool_name, data.get("tool_input"))
         state["statusDetail"] = (tool_name + " " + tgt).strip() if tgt else tool_name
 
     elif event == "PostToolUse":
         state["status"] = "working"
+        state["needsPermission"] = False
         tool_name = data.get("tool_name") or "tool"
         state["statusDetail"] = "ran " + tool_name
 
     elif event == "Notification":
         state["status"] = "waiting"
         msg = data.get("message") or ""
+        # A `.waiting` session is only a REAL permission request when Claude's
+        # notification mentions permission (it says "needs your permission to
+        # use <tool>"). Idle "Claude is waiting for your input" notifications —
+        # very common in AUTO mode, where tool permissions are auto-accepted and
+        # there is NO prompt — must NOT show the Approve/Deny buttons. Be
+        # conservative: only true when "permission" is clearly present.
+        state["needsPermission"] = bool(
+            isinstance(msg, str) and "permission" in msg.lower()
+        )
         if isinstance(msg, str) and msg:
             msg = " ".join(msg.split())
             state["statusDetail"] = (msg[:80] + "…") if len(msg) > 80 else msg
@@ -211,6 +282,7 @@ try:
     elif event == "Stop":
         state["status"] = "done"
         state["statusDetail"] = "finished"
+        state["needsPermission"] = False
 
     elif event == "SubagentStop":
         # Leave parent status unchanged; just bump updatedAt below.

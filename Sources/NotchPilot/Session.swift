@@ -48,6 +48,14 @@ struct Session: Codable, Identifiable, Equatable, Sendable {
     var cwd: String?
     var status: SessionStatus
     var statusDetail: String?
+    /// Whether a `.waiting` session is a REAL permission request (Claude's
+    /// notification said "needs your permission to use <tool>"), as opposed to an
+    /// idle "Claude is waiting for your input" (very common in AUTO mode, where
+    /// there is no prompt to answer). Only when `true` should the row show the
+    /// Approve / Allow Once / Deny buttons. Optional + decode-tolerant so older
+    /// state files (without the field) still decode; nil/false both mean "no
+    /// permission prompt".
+    var needsPermission: Bool?
     var tty: String?
     var termSessionId: String?
     /// `TERM_PROGRAM` of the owning terminal, e.g. "Apple_Terminal", "iTerm.app",
@@ -72,6 +80,11 @@ struct Session: Codable, Identifiable, Equatable, Sendable {
     /// `transcript_path`; may be absent on older state files. Read on demand —
     /// see `lastAssistantSummary(maxChars:)` — NEVER from a SwiftUI render path.
     var transcriptPath: String?
+    /// How many tokens the most recent assistant turn carried in its prompt
+    /// (input + cache-read + cache-creation), i.e. how full the model's context
+    /// window is. Captured defensively by the hook from the transcript tail; may
+    /// be absent (older state files, or no assistant turn yet). Decode-tolerant.
+    var contextTokens: Int?
     var updatedAt: Date
 
     var id: String { sessionId }
@@ -82,6 +95,36 @@ struct Session: Codable, Identifiable, Equatable, Sendable {
         if let bracket = m.firstIndex(of: "[") { m = String(m[..<bracket]) }
         m = m.replacingOccurrences(of: "claude-", with: "")
         return m.trimmingCharacters(in: .whitespaces).isEmpty ? nil : m
+    }
+
+    /// The model's total context window in tokens. We can't know it exactly from
+    /// the state file, so we infer from the model name: a "[1m]" / "1m" variant is
+    /// the 1,000,000-token window; everything else defaults to 200,000.
+    var contextWindow: Int {
+        if let m = model?.lowercased(), m.contains("1m") { return 1_000_000 }
+        return 200_000
+    }
+
+    /// How full the context window is, as an integer percent (0–100). Nil when we
+    /// have no token count yet. Rounds to the nearest percent and clamps to 0–100
+    /// (a turn can momentarily report slightly above the nominal window).
+    var contextPercent: Int? {
+        guard let tokens = contextTokens, tokens > 0 else { return nil }
+        let pct = Int((Double(tokens) / Double(contextWindow) * 100).rounded())
+        return min(100, max(0, pct))
+    }
+
+    /// Total session age — `startedAt` to now — formatted compactly ("2h14m",
+    /// "45m", "30s"). This is the session's LIFETIME, distinct from the current
+    /// working turn (`turnElapsed`). Nil if we never captured `startedAt`.
+    func sessionElapsed(asOf now: Date = Date()) -> String? {
+        guard let start = startedAt else { return nil }
+        let secs = Int(max(0, now.timeIntervalSince(start)))
+        if secs < 60 { return "\(secs)s" }
+        let m = secs / 60
+        if m < 60 { return "\(m)m" }
+        let h = m / 60
+        return "\(h)h\(m % 60)m"
     }
 
     /// Human elapsed time for the current working turn, e.g. "2m14s". Nil unless working.
@@ -113,7 +156,7 @@ struct Session: Codable, Identifiable, Equatable, Sendable {
     /// We also tolerate `{"role":"assistant","content":"…"}` and content arrays
     /// whose items are plain strings or `{type:text,text:…}` parts. We scan lines
     /// from the END and return the first assistant turn that yields non-empty text.
-    func lastAssistantSummary(maxChars: Int = 2000) -> String? {
+    func lastAssistantSummary(maxChars: Int = 100_000) -> String? {
         guard let path = transcriptPath, !path.isEmpty else { return nil }
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
 

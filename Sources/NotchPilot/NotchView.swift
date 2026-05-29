@@ -437,7 +437,7 @@ private struct SessionRow: View {
     /// while it's 0 we fall back to a sensible non-collapsed height.
     @State private var contextTextHeight: CGFloat = 0
     /// Cap for the REPLYING-TO reading pane; above this it scrolls internally.
-    private let contextMaxHeight: CGFloat = 320
+    private let contextMaxHeight: CGFloat = 480
     /// Fallback height before the first measurement lands, so the pane never
     /// renders collapsed to ~2 lines on the first pass.
     private let contextFallbackHeight: CGFloat = 120
@@ -520,6 +520,7 @@ private struct SessionRow: View {
                     }
 
                     detailLine
+                    metaLine
                 }
 
                 Spacer(minLength: Theme.Space.sm)
@@ -531,10 +532,15 @@ private struct SessionRow: View {
                 replyButton
             }
 
-            // Row 2 — permission menu (waiting rows only). On its OWN full-width
-            // line below the main row so the content-sized Approve/Allow Once/Deny
-            // buttons get the whole panel width and don't compress the top line.
-            if isWaiting {
+            // Row 2 — permission menu. Shown ONLY for a waiting row that is a REAL
+            // permission request (`needsPermission == true`). A `.waiting` session
+            // that's just idle / awaiting the user's next input (e.g. AUTO mode,
+            // where tool permissions are auto-accepted so there's NO prompt — its
+            // notification reads "Claude is waiting for your input") shows NO
+            // Approve/Allow Once/Deny buttons; the reply (↩) affordance already
+            // lets the user respond. On its OWN full-width line below the main row
+            // so the content-sized buttons get the whole panel width.
+            if isWaiting && session.needsPermission == true {
                 permissionActions
             }
 
@@ -837,6 +843,32 @@ private struct SessionRow: View {
             if !showing {
                 replyText = ""
                 replyHeight = 20
+            }
+        }
+    }
+
+    /// Small, muted meta hints beneath the detail line: context-window usage
+    /// (`ctx 42%`) and total session lifetime (`2h14m`), joined with a middot —
+    /// e.g. `ctx 42% · 2h14m`. Context percent shows only when `contextPercent`
+    /// is known; the session time only when `sessionElapsed()` is known; the line
+    /// hides entirely when neither is available. The session time is a LIFETIME
+    /// value (distinct from the live `running <turn>` in `detailLine`); it ticks
+    /// once a second via `TimelineView` so it stays current without depending on
+    /// state-file updates. Monospaced digits keep it from jittering as it ticks.
+    @ViewBuilder private var metaLine: some View {
+        let pct = session.contextPercent
+        if pct != nil || session.startedAt != nil {
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                let parts: [String] = [
+                    pct.map { "ctx \($0)%" },
+                    session.sessionElapsed(asOf: timeline.date),
+                ].compactMap { $0 }
+                if !parts.isEmpty {
+                    Text(parts.joined(separator: " · "))
+                        .font(.system(size: 10, weight: .regular, design: .monospaced))
+                        .foregroundStyle(Color.cl.onDarkSoft)
+                        .lineLimit(1)
+                }
             }
         }
     }
