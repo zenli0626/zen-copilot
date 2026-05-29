@@ -27,14 +27,16 @@ enum SessionStatus: String, Codable, Sendable {
         }
     }
 
-    /// Sort priority: waiting first, then working, then idle/done/error.
+    /// Sort priority: the things that need the human float to the top —
+    /// waiting first, then error (a failed turn is easy to miss but wants you),
+    /// then in-flight working, then done, then idle.
     var sortRank: Int {
         switch self {
         case .waiting: return 0
-        case .working: return 1
-        case .done: return 2
-        case .idle: return 3
-        case .error: return 4
+        case .error: return 1
+        case .working: return 2
+        case .done: return 3
+        case .idle: return 4
         }
     }
 }
@@ -46,6 +48,19 @@ struct Session: Codable, Identifiable, Equatable, Sendable {
     var sessionId: String
     var project: String
     var cwd: String?
+    /// Current git branch of `cwd` (or `@<short-sha>` when detached), captured by
+    /// the hook. The primary disambiguator for same-named sessions / worktrees.
+    /// Decode-tolerant: nil for non-git dirs or older state files.
+    var gitBranch: String?
+    /// True when `cwd` is a LINKED git worktree (not the main checkout). Drives the
+    /// small "WT" tag so duplicate-named worktree rows are obvious. Decode-tolerant.
+    var isWorktree: Bool?
+    /// Absolute toplevel of `cwd`'s working tree (distinct per worktree). Optional.
+    var gitRepoRoot: String?
+    /// STABLE shared-repo name — identical for every worktree of one repo (basename
+    /// of the dir holding the common `.git`). Lets the UI group/identify by repo even
+    /// when worktree dir names differ. Decode-tolerant.
+    var repoName: String?
     var status: SessionStatus
     var statusDetail: String?
     /// Whether a `.waiting` session is a REAL permission request (Claude's
@@ -65,6 +80,10 @@ struct Session: Codable, Identifiable, Equatable, Sendable {
     var startedAt: Date?
     /// When the current `working` turn began; nil unless actively working.
     var turnStartedAt: Date?
+    /// When the session ENTERED its current waiting state (stamped by the hook on the
+    /// transition into waiting; nil otherwise). Drives "blocked for 17m" + oldest-
+    /// waiting-first triage. Decode-tolerant; falls back to `updatedAt` when absent.
+    var enteredStatusAt: Date?
     /// Subagent / parent-child linkage — DEFENSIVE, optional. The Claude Code
     /// hook payload does not currently expose reliable parent→child linkage for
     /// Task-tool subagents; these decode whatever the hook captured (if anything)
@@ -88,6 +107,37 @@ struct Session: Codable, Identifiable, Equatable, Sendable {
     var updatedAt: Date
 
     var id: String { sessionId }
+
+    /// Key identifying one attention EPISODE: id + status + a per-episode stamp.
+    /// The stamp is `enteredStatusAt` (stable across a wait, fresh on each new wait)
+    /// and falls back to `updatedAt` for error/done (which the hook re-stamps each
+    /// time they're (re)entered). Used by the unread badge + per-row dots so a
+    /// re-entered status re-notifies instead of colliding with a persisted seen-key.
+    static func attentionEpisodeKey(_ s: Session) -> String {
+        let stamp = Int((s.enteredStatusAt ?? s.updatedAt).timeIntervalSince1970)
+        return "\(s.id):\(s.status.rawValue):\(stamp)"
+    }
+
+    /// Home-abbreviated form of `cwd` for display — "/Users/zenli/BY-Website/by"
+    /// → "~/BY-Website/by". Nil when `cwd` is missing/empty. Used as the full
+    /// location string (the row truncates it in the middle so the head and the
+    /// project tail both stay visible, which is what disambiguates two same-named
+    /// sessions living in different directories / worktrees).
+    var cwdHome: String? {
+        guard let cwd, !cwd.isEmpty else { return nil }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if cwd == home { return "~" }
+        if cwd.hasPrefix(home + "/") { return "~/" + String(cwd.dropFirst(home.count + 1)) }
+        return cwd
+    }
+
+    /// Short terminal-tab tag from `tty` ("/dev/ttys005" → "ttys005"). Guaranteed
+    /// unique per tab, so it's the last-resort disambiguator when two sessions share
+    /// both project name AND directory. Nil when tty is missing/"??".
+    var ttyShort: String? {
+        guard let tty, !tty.isEmpty, tty != "??" else { return nil }
+        return tty.replacingOccurrences(of: "/dev/", with: "")
+    }
 
     /// Compact model label for the row badge, e.g. "claude-opus-4-8[1m]" → "opus-4-8".
     var modelShort: String? {
@@ -127,6 +177,26 @@ struct Session: Codable, Identifiable, Equatable, Sendable {
         return "\(h)h\(m % 60)m"
     }
 
+    /// How long this session has been WAITING, in seconds. Uses `enteredStatusAt`
+    /// (stamped on the transition into waiting) and falls back to `updatedAt` for
+    /// older state files. Nil unless currently waiting.
+    func waitSeconds(asOf now: Date = Date()) -> Int? {
+        guard status == .waiting else { return nil }
+        let since = enteredStatusAt ?? updatedAt
+        return Int(max(0, now.timeIntervalSince(since)))
+    }
+
+    /// Human "blocked for" label for a waiting session, e.g. "17m", "2h4m", "45s".
+    /// Nil unless waiting.
+    func waitElapsed(asOf now: Date = Date()) -> String? {
+        guard let secs = waitSeconds(asOf: now) else { return nil }
+        if secs < 60 { return "\(secs)s" }
+        let m = secs / 60
+        if m < 60 { return "\(m)m" }
+        let h = m / 60
+        return "\(h)h\(m % 60)m"
+    }
+
     /// Human elapsed time for the current working turn, e.g. "2m14s". Nil unless working.
     func turnElapsed(asOf now: Date = Date()) -> String? {
         guard status == .working, let start = turnStartedAt else { return nil }
@@ -147,8 +217,10 @@ struct Session: Codable, Identifiable, Equatable, Sendable {
     ///
     /// PERFORMANCE / SAFETY: this does synchronous file IO and JSON parsing, so it
     /// MUST be called on demand (e.g. once when the reply box opens) and the result
-    /// cached — NEVER from a SwiftUI `body` / render path. It is fully defensive:
-    /// it never throws and never crashes.
+    /// cached — NEVER from a SwiftUI `body` / render path. It reads only the TAIL of
+    /// the transcript (256KB, expanding to 1MB→4MB→8MB only if the last assistant
+    /// text hasn't been found yet), so it stays fast even on multi-hundred-MB
+    /// transcripts. It is fully defensive: never throws, never crashes.
     ///
     /// Transcript format: each line is one JSON object. An assistant text turn
     /// looks roughly like
@@ -160,10 +232,58 @@ struct Session: Codable, Identifiable, Equatable, Sendable {
         guard let path = transcriptPath, !path.isEmpty else { return nil }
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
 
-        // Read the whole file as UTF-8; bail quietly on any failure.
-        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        // Expand-and-retry windows. Unlike `usage` (always on the very last line),
+        // the last assistant TEXT can be pushed back by a large trailing tool_result,
+        // so a fixed 256KB tail could miss it — we grow the window until we find it.
+        let windows = [256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024]
+        for window in windows {
+            guard let (text, wholeFile) = Session.tailText(of: url, window: window) else { return nil }
+            if let summary = Session.scanLastAssistant(in: text, maxChars: maxChars) {
+                return summary
+            }
+            // The window already covered the WHOLE file and found no assistant text —
+            // growing won't help, so stop (nil) rather than re-reading it below.
+            if wholeFile { return nil }
+        }
+        // File exceeded the largest (8MB) window and the tail never contained an
+        // assistant text turn — the last one was pushed back by a huge trailing
+        // tool_result. Do one guaranteed whole-file pass so the reply context isn't
+        // empty on exactly the big transcripts the tail-read was meant to speed up.
+        if let data = try? Data(contentsOf: url) {
+            return Session.scanLastAssistant(in: String(decoding: data, as: UTF8.self), maxChars: maxChars)
+        }
+        return nil
+    }
 
-        // Split into lines and scan from the END for the last assistant text turn.
+    /// Read up to the last `window` bytes of `url` as UTF-8, dropping the partial
+    /// first line after a mid-file seek. Returns the text and whether it covered the
+    /// WHOLE file (so callers can stop expanding). Nil on any IO error — fully
+    /// defensive (FileHandle calls are wrapped; never crashes).
+    private static func tailText(of url: URL, window: Int) -> (text: String, wholeFile: Bool)? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        do {
+            let size = try handle.seekToEnd()
+            if size <= UInt64(window) {
+                try handle.seek(toOffset: 0)
+                guard let data = try handle.readToEnd() else { return nil }
+                return (String(decoding: data, as: UTF8.self), true)
+            }
+            try handle.seek(toOffset: size - UInt64(window))
+            guard let data = try handle.readToEnd() else { return nil }
+            var text = String(decoding: data, as: UTF8.self)
+            if let nl = text.firstIndex(of: "\n") {
+                text = String(text[text.index(after: nl)...])
+            }
+            return (text, false)
+        } catch {
+            return nil
+        }
+    }
+
+    /// Scan `contents` (a transcript or transcript tail) from the END for the last
+    /// assistant text turn and return its condensed summary, or nil.
+    private static func scanLastAssistant(in contents: String, maxChars: Int) -> String? {
         let lines = contents.split(separator: "\n", omittingEmptySubsequences: true)
         for line in lines.reversed() {
             let trimmed = line.trimmingCharacters(in: .whitespaces)

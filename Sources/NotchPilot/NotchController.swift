@@ -32,6 +32,70 @@ final class NotchInbox: ObservableObject {
     @Published var wellnessActive = false
 }
 
+/// Per-session READ state for the expanded panel's attention dots.
+///
+/// A waiting/done row shows a leading dot only while its attention is *unread*.
+/// "Reading" is an explicit, per-row act — diving into the session (↗) or opening
+/// its reply (↩) — NOT merely opening the panel, so the dots survive a glance and
+/// only clear as you actually handle each one. Keyed by `id:status` (same shape as
+/// the compact badge's `attentionKey`) so a session re-entering attention
+/// (working→waiting again) gets a fresh key and its dot returns.
+///
+/// Distinct from `NotchInbox` on purpose: the compact badge answers "did anything
+/// NEW arrive since I last looked" (clears on open); these dots answer "which ones
+/// haven't I handled yet" (clear on per-row action).
+@MainActor
+final class AttentionReadState: ObservableObject {
+    @Published private(set) var readKeys: Set<String> = []
+
+    /// Where read keys persist across app restarts, so relaunching doesn't re-flag
+    /// every still-waiting session as unread (a real annoyance: an in-memory-only
+    /// set means a fresh launch shows a dot on everything you'd already handled).
+    private let defaultsKey = "zencopilot.attentionReadKeys"
+
+    init() {
+        if let saved = UserDefaults.standard.array(forKey: defaultsKey) as? [String] {
+            readKeys = Set(saved)
+        }
+    }
+
+    private func key(for session: Session) -> String {
+        Session.attentionEpisodeKey(session)
+    }
+
+    private func persist() {
+        UserDefaults.standard.set(Array(readKeys), forKey: defaultsKey)
+    }
+
+    private func isAttention(_ status: SessionStatus) -> Bool {
+        status == .waiting || status == .done || status == .error
+    }
+
+    /// Whether `session`'s current attention is unread — i.e. it's waiting/done/error
+    /// and the user hasn't dived into or replied to it since it entered this status.
+    func isUnread(_ session: Session) -> Bool {
+        isAttention(session.status) && !readKeys.contains(key(for: session))
+    }
+
+    /// Mark this session's current attention as read (clears its dot). Persisted.
+    func markRead(_ session: Session) {
+        let (inserted, _) = readKeys.insert(key(for: session))
+        if inserted { persist() }
+    }
+
+    /// Drop read keys that no longer match a live attention item, so a reused id —
+    /// or a session that left and re-entered attention — re-shows its dot. Persisted
+    /// when it actually changes (keeps the store from growing without bound on disk).
+    func prune(to sessions: [Session]) {
+        let live = Set(sessions
+            .filter { isAttention($0.status) }
+            .map { key(for: $0) })
+        let before = readKeys.count
+        readKeys.formIntersection(live)
+        if readKeys.count != before { persist() }
+    }
+}
+
 /// Owns the DynamicNotchKit panel and drives its expand/compact/hide lifecycle.
 ///
 /// Behavior:
@@ -60,12 +124,22 @@ final class NotchController {
     /// (see `recomputeInbox` / `markCurrentAttentionSeen`). Injected into `CompactGlyph`.
     private let inbox = NotchInbox()
 
-    /// Attention items the user has already SEEN. Each waiting/done session is
+    /// Per-row read state for the expanded panel's attention dots. Cleared per-row
+    /// when the user dives in / replies; pruned to live attention items on refresh.
+    private let readState = AttentionReadState()
+
+    /// Attention items the user has already SEEN. Each waiting/done/error session is
     /// keyed by `"\(id):\(status.rawValue)"`, so a session going working→waiting
     /// (or re-entering done) produces a *new* key and re-notifies. Pruned to live
     /// session ids in `recomputeInbox` so it can't grow unbounded and a reused id
-    /// re-notifies cleanly.
+    /// re-notifies cleanly. Hydrated from / persisted to `seenDefaultsKey` so a
+    /// relaunch doesn't re-badge sessions you already saw.
     private var seenAttentionKeys: Set<String> = []
+    private let seenDefaultsKey = "zencopilot.seenAttentionKeys"
+
+    private func persistSeen() {
+        UserDefaults.standard.set(Array(seenAttentionKeys), forKey: seenDefaultsKey)
+    }
 
     /// The three display states the notch can resolve to.
     private enum Display { case hidden, compact, expanded }
@@ -112,11 +186,12 @@ final class NotchController {
         let interaction = self.interaction
         let wellness = self.wellness
         let inbox = self.inbox
+        let readState = self.readState
         let notch = DynamicNotch(
             hoverBehavior: .all,
             style: .auto,
             expanded: {
-                NotchView(store: store, interaction: interaction, wellness: wellness) { session in
+                NotchView(store: store, interaction: interaction, wellness: wellness, readState: readState) { session in
                     FocusController.focus(session: session)
                 }
             },
@@ -131,6 +206,7 @@ final class NotchController {
             .receive(on: RunLoop.main)
             .sink { [weak self] sessions in
                 self?.noteTransitions(in: sessions)
+                self?.readState.prune(to: sessions)
                 self?.recomputeInbox()
                 self?.refresh()
             }
@@ -176,18 +252,26 @@ final class NotchController {
             }
             .store(in: &cancellables)
 
+        // Hydrate the persisted seen-set BEFORE the first recompute, which then
+        // prunes it against live sessions — so a still-waiting session you already
+        // saw stays badge-free across relaunch (no flash-then-clear).
+        if let saved = UserDefaults.standard.array(forKey: seenDefaultsKey) as? [String] {
+            seenAttentionKeys = Set(saved)
+        }
+
         recomputeInbox()
         refresh()
     }
 
-    /// Detect sessions that *just* transitioned into waiting/done and open a
-    /// short flash window so the notch pops out once per new event, then settles.
+    /// Detect sessions that *just* transitioned into an attention status
+    /// (waiting/done/error) and open a short flash window so the notch pops out
+    /// once per new event, then settles.
     private func noteTransitions(in sessions: [Session]) {
         var sawNewAttention = false
         for session in sessions {
             let previous = lastStatuses[session.id]
             if previous != session.status,
-               session.status == .waiting || session.status == .done {
+               session.status == .waiting || session.status == .done || session.status == .error {
                 sawNewAttention = true
             }
             lastStatuses[session.id] = session.status
@@ -201,39 +285,49 @@ final class NotchController {
         }
     }
 
-    /// Stable key for an attention (waiting/done) session. Changes whenever the
-    /// session enters a *new* attention status, so working→waiting or
-    /// working→done produces a fresh, unread key even for the same session id.
+    /// Stable key for an attention (waiting/done/error) EPISODE. Includes a
+    /// per-episode discriminator so a session that goes waiting→working→waiting
+    /// (even across an app restart, where the persisted seen-set is reloaded)
+    /// produces a fresh, unread key rather than reusing the prior `id:status` and
+    /// silently suppressing the new prompt.
     private func attentionKey(_ session: Session) -> String {
-        "\(session.id):\(session.status.rawValue)"
+        Session.attentionEpisodeKey(session)
     }
 
-    /// Current waiting/done keys across all live sessions.
+    /// Whether a status wants the human's attention (badge / dot / flash).
+    private func isAttention(_ status: SessionStatus) -> Bool {
+        status == .waiting || status == .done || status == .error
+    }
+
+    /// Current waiting/done/error keys across all live sessions.
     private func currentAttentionKeys() -> [String] {
         store.sessions
-            .filter { $0.status == .waiting || $0.status == .done }
+            .filter { isAttention($0.status) }
             .map(attentionKey)
     }
 
     /// Recompute the unread badge state and prune the seen set to live ids.
     ///
-    /// UNREAD = current waiting/done sessions whose key isn't yet in `seenAttentionKeys`.
+    /// UNREAD = current waiting/done/error sessions whose key isn't in `seenAttentionKeys`.
     /// The seen set is pruned to keys belonging to currently-attention sessions so it
     /// can't grow without bound and a reused id (or a session that left + re-entered
     /// attention) re-notifies. The badge tint follows the most-urgent *unread* item.
+    /// Persists the seen set whenever the prune actually changes it.
     private func recomputeInbox() {
-        let currentKeys = currentAttentionKeys()
-        let currentSet = Set(currentKeys)
+        let currentSet = Set(currentAttentionKeys())
         // Drop seen keys that no longer correspond to a live attention item.
+        let before = seenAttentionKeys.count
         seenAttentionKeys.formIntersection(currentSet)
+        if seenAttentionKeys.count != before { persistSeen() }
 
         let unreadSessions = store.sessions.filter {
-            ($0.status == .waiting || $0.status == .done)
-                && !seenAttentionKeys.contains(attentionKey($0))
+            isAttention($0.status) && !seenAttentionKeys.contains(attentionKey($0))
         }
         inbox.unreadCount = unreadSessions.count
         inbox.wellnessActive = wellness.active != nil
-        if unreadSessions.contains(where: { $0.status == .waiting }) {
+        if unreadSessions.contains(where: { $0.status == .error }) {
+            inbox.tint = .cl.error
+        } else if unreadSessions.contains(where: { $0.status == .waiting }) {
             inbox.tint = .cl.amber
         } else if unreadSessions.contains(where: { $0.status == .done }) {
             inbox.tint = .cl.teal
@@ -243,10 +337,12 @@ final class NotchController {
         }
     }
 
-    /// Mark every current waiting/done item as SEEN (called when the user opens
+    /// Mark every current waiting/done/error item as SEEN (called when the user opens
     /// the notch). Drives `unreadCount` to 0 until a *new* attention event arrives.
     private func markCurrentAttentionSeen() {
+        let before = seenAttentionKeys.count
         seenAttentionKeys.formUnion(currentAttentionKeys())
+        if seenAttentionKeys.count != before { persistSeen() }
         recomputeInbox()
     }
 
@@ -319,6 +415,7 @@ struct CompactGlyph: View {
     /// Body color, by status priority: waiting → amber, done → teal,
     /// working → green; otherwise coral (idle/calm = the brand mascot color).
     private var tint: Color {
+        if store.sessions.contains(where: { $0.status == .error }) { return .cl.error }
         if store.sessions.contains(where: { $0.status == .waiting }) { return .cl.amber }
         if store.sessions.contains(where: { $0.status == .done }) { return .cl.teal }
         if store.sessions.contains(where: { $0.status == .working }) { return .cl.success }
@@ -409,6 +506,7 @@ struct CompactCount: View {
     @ObservedObject var store: SessionStore
 
     private var tint: Color {
+        if store.sessions.contains(where: { $0.status == .error }) { return .red }
         if store.sessions.contains(where: { $0.status == .waiting }) { return .orange }
         if store.sessions.contains(where: { $0.status == .done }) { return .blue }
         if store.sessions.contains(where: { $0.status == .working }) { return .green }

@@ -30,6 +30,13 @@ final class SessionStore: ObservableObject {
     private var dirFD: CInt = -1
     private var dirSource: DispatchSourceFileSystemObject?
     private var pollTimer: Timer?
+    /// Coalesces bursts of directory events into a single reload ~150ms later, so a
+    /// flurry of hook writes across many sessions doesn't re-decode the dir N times.
+    private var reloadWork: DispatchWorkItem?
+    /// mtime cache so unchanged session files are reused instead of re-decoded each
+    /// reload (cheap with many sessions). Keyed by file URL; evicted when the file
+    /// disappears. Staleness is still recomputed every reload from `updatedAt`.
+    private var fileCache: [URL: (mtime: Date, session: Session)] = [:]
 
     /// Last seen status per session id, to detect transitions.
     private var lastStatus: [String: SessionStatus] = [:]
@@ -89,12 +96,13 @@ final class SessionStore: ObservableObject {
         source.setEventHandler { [weak self] in
             guard let self else { return }
             let flags = source.data
-            // If the directory itself was removed/renamed, rebuild the monitor.
+            // If the directory itself was removed/renamed, rebuild the monitor now.
             if flags.contains(.delete) || flags.contains(.rename) {
                 self.ensureDirectoryExists()
                 self.startDirectoryMonitor()
             }
-            self.reload()
+            // Coalesce the reload so a burst of writes triggers one decode pass.
+            self.scheduleReload()
         }
         source.setCancelHandler { [fd] in
             close(fd)
@@ -111,28 +119,56 @@ final class SessionStore: ObservableObject {
 
     // MARK: - Loading
 
+    /// Debounced reload: collapse a burst of directory-change events into one decode
+    /// pass ~150ms later. The 2s poll and manual actions still call `reload()` directly.
+    private func scheduleReload() {
+        reloadWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.reload() }
+        reloadWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
     func reload() {
         let fm = FileManager.default
         let urls = (try? fm.contentsOfDirectory(
             at: sessionsDir,
-            includingPropertiesForKeys: nil,
+            includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles])) ?? []
 
         let now = Date()
         var loaded: [Session] = []
+        var present: Set<URL> = []
         for url in urls where url.pathExtension == "json" {
+            present.insert(url)
+            let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            // Unchanged file → reuse the cached decode (still re-checking staleness,
+            // which depends on `now`, not the file).
+            if let mtime, let cached = fileCache[url], cached.mtime == mtime {
+                if !isStale(cached.session, now: now) { loaded.append(cached.session) }
+                continue
+            }
             guard let data = try? Data(contentsOf: url),
                   let session = try? decoder.decode(Session.self, from: data) else {
                 continue
             }
+            if let mtime { fileCache[url] = (mtime, session) }
             // Drop stale sessions (per-status windows; see `isStale`).
             if isStale(session, now: now) { continue }
             loaded.append(session)
+        }
+        // Bound the cache: forget files that are no longer present.
+        if fileCache.count != present.count {
+            fileCache = fileCache.filter { present.contains($0.key) }
         }
 
         let sorted = loaded.sorted { lhs, rhs in
             if lhs.status.sortRank != rhs.status.sortRank {
                 return lhs.status.sortRank < rhs.status.sortRank
+            }
+            // Within the WAITING group, oldest-blocked floats to the top (you've
+            // neglected it longest); every other status keeps most-recent-first.
+            if lhs.status == .waiting {
+                return (lhs.enteredStatusAt ?? lhs.updatedAt) < (rhs.enteredStatusAt ?? rhs.updatedAt)
             }
             return lhs.updatedAt > rhs.updatedAt
         }

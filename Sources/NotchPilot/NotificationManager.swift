@@ -6,6 +6,10 @@ import UserNotifications
 @MainActor
 final class NotificationManager {
     private var authorized = false
+    /// Last time we fired an ERROR notification per session, to throttle a retry
+    /// loop (working→error→working→error) from machine-gunning Basso + banners.
+    private var lastErrorNotified: [String: Date] = [:]
+    private let errorCooldown: TimeInterval = 60
 
     func requestAuthorization() {
         let center = UNUserNotificationCenter.current()
@@ -26,15 +30,29 @@ final class NotificationManager {
         guard from != nil else { return }
         guard from != to else { return }
 
+        let name = Settings.shared.displayName(for: session)
         switch to {
-        case .done:
-            post(title: "✅ \(session.project) finished",
-                 body: session.statusDetail ?? "Turn complete.")
-            playSound(named: "Glass")
         case .waiting:
-            post(title: "⏳ \(session.project) needs you",
+            post(title: "⏳ \(name) needs you",
                  body: session.statusDetail ?? "Waiting for your input.")
             playSound(named: "Submarine")
+        case .error:
+            // Throttle: a flaky-command retry loop oscillates working↔error; without
+            // this it would fire a Basso + banner every cycle and train you to ignore it.
+            let now = Date()
+            if let last = lastErrorNotified[session.id], now.timeIntervalSince(last) < errorCooldown {
+                break
+            }
+            lastErrorNotified[session.id] = now
+            post(title: "⚠️ \(name) errored",
+                 body: session.statusDetail ?? "Last turn hit an error.")
+            playSound(named: "Basso")
+        case .done:
+            // A completed turn resets the error throttle so a NEW error afterward notifies.
+            lastErrorNotified[session.id] = nil
+            post(title: "✅ \(name) finished",
+                 body: session.statusDetail ?? "Turn complete.")
+            playSound(named: "Glass")
         default:
             break
         }

@@ -12,6 +12,10 @@ struct NotchView: View {
     /// Live wellness cue. When `active != nil` the header pet performs the matching
     /// cue and a speech bubble shows its caption for the reminder's display window.
     @ObservedObject var wellness: WellnessState
+    /// Per-row read state: drives the leading attention dot (shown only while a
+    /// waiting/done row is UNREAD) and is cleared per-row when the user dives in or
+    /// opens a reply. Owned by `NotchController`.
+    @ObservedObject var readState: AttentionReadState
     var onSelect: (Session) -> Void
 
     /// The session whose inline reply field is currently open, if any. Only one
@@ -24,6 +28,10 @@ struct NotchView: View {
     /// transcript file off disk. Shown muted above the composer. Falls back to the
     /// session's `statusDetail` when the transcript yields nothing.
     @State private var replyContext: String?
+    /// Measured natural height of the session list, so the surrounding ScrollView
+    /// can hug content when short and cap+scroll only when it would overflow the
+    /// screen. 0 until the first measurement lands.
+    @State private var listContentHeight: CGFloat = 0
 
     // MARK: - Stroll ("the pet goes for a walk") state
 
@@ -122,23 +130,71 @@ struct NotchView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, Theme.Space.sm)
             } else {
-                VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                    ForEach(store.sessions) { session in
-                        SessionRow(
-                            session: session,
-                            isReplying: replyingTo == session.id,
-                            // Compact the OTHER rows while a reply is open on one of
-                            // them — keeps focus on the replied-to session.
-                            dimmed: replyingTo != nil && replyingTo != session.id,
-                            replyContext: replyingTo == session.id ? replyContext : nil,
-                            replyFocused: $replyFocused,
-                            onReply: { toggleReply(for: session) },
-                            onSubmitReply: { text in submitReply(text, to: session) },
-                            onCancelReply: { dismissReply() }
+                // The session list scrolls INTERNALLY once it would exceed the
+                // usable screen height. Without this cap the panel grows with the
+                // session count and DynamicNotchKit sizes the panel to content, so
+                // 6+ sessions push the bottom rows off the screen edge (the same
+                // class of bug as the reply pane). `maxListHeight` leaves room for
+                // the header + reminder banner + paddings.
+                ScrollView(.vertical, showsIndicators: true) {
+                    ScrollViewReader { proxy in
+                        VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                            ForEach(store.sessions) { session in
+                                SessionRow(
+                                    session: session,
+                                    isReplying: replyingTo == session.id,
+                                    // Compact the OTHER rows while a reply is open on one of
+                                    // them — keeps focus on the replied-to session.
+                                    dimmed: replyingTo != nil && replyingTo != session.id,
+                                    replyContext: replyingTo == session.id ? replyContext : nil,
+                                    // The dot shows only while this row's attention is unread;
+                                    // diving in or replying (below) clears it.
+                                    isUnread: readState.isUnread(session),
+                                    // When two live sessions share a project name (e.g. two
+                                    // worktrees of the same repo), the row shows a location
+                                    // subtitle (path · branch · tab) so they're tellable apart.
+                                    nameClash: clashingDisplayNames.contains(Settings.shared.displayName(for: session)),
+                                    replyFocused: $replyFocused,
+                                    onReply: { toggleReply(for: session) },
+                                    onSubmitReply: { text in submitReply(text, to: session) },
+                                    onCancelReply: { dismissReply() },
+                                    onJump: {
+                                        readState.markRead(session)
+                                        onSelect(session)
+                                    }
+                                )
+                                    .id(session.id)
+                                    .contentShape(Rectangle())
+                                    // Don't front the terminal (or show the row menu) for taps in
+                                    // an OPEN reply card's chrome — that would steal focus and
+                                    // drop the in-progress reply. The ⋯ button still gives actions.
+                                    .onTapGesture { if replyingTo != session.id { onSelect(session) } }
+                                    .contextMenu { if replyingTo != session.id { zcRowActions(session) } }
+                            }
+                        }
+                        // Measure the list's natural height so the ScrollView can size to
+                        // content when short and cap+scroll only when it would overflow.
+                        .background(
+                            GeometryReader { proxy in
+                                Color.clear.preference(key: SessionListHeightKey.self, value: proxy.size.height)
+                            }
                         )
-                            .contentShape(Rectangle())
-                            .onTapGesture { onSelect(session) }
+                        // When a reply opens, scroll its row (with the tall composer)
+                        // into view so the focused field is never below the fold.
+                        .onChange(of: replyingTo) { _, newValue in
+                            if let id = newValue {
+                                withAnimation(.easeInOut(duration: 0.2)) { proxy.scrollTo(id, anchor: .center) }
+                            }
+                        }
                     }
+                }
+                // Content-sized up to the screen cap; scrolls internally beyond it.
+                // Before the first measurement lands, fall back to the cap so it
+                // never renders collapsed.
+                .frame(height: listContentHeight > 0 ? min(listContentHeight, maxListHeight) : maxListHeight)
+                .onPreferenceChange(SessionListHeightKey.self) { h in
+                    guard abs(h - listContentHeight) > 0.5 else { return }
+                    DispatchQueue.main.async { listContentHeight = h }
                 }
             }
         }
@@ -147,7 +203,7 @@ struct NotchView: View {
         // Widen the panel while a reply is open so Claude's message wraps onto
         // fewer lines and far more of it is visible at once. DynamicNotchKit
         // resizes the panel to the content, so changing the frame width suffices.
-        .frame(width: replyingTo != nil ? 520 : 360)
+        .frame(width: replyingTo != nil ? 520 : restingPanelWidth)
         // Paint our own warm Claude product-chrome surface so the panel reads as
         // #181715 (not pure black) regardless of DynamicNotchKit's backing.
         .background(Color.cl.surfaceDark)
@@ -224,8 +280,7 @@ struct NotchView: View {
 
         // Far-edge target: panel width minus both horizontal paddings and the
         // pet's own width, so it stops flush at the inner right edge.
-        let panelWidth: CGFloat = 360   // calm/non-reply width
-        let travel = panelWidth - Theme.Space.lg * 2 - strollPetWidth
+        let travel = max(0, restingPanelWidth - Theme.Space.lg * 2 - strollPetWidth)
 
         // Phase 1 — walk OUT (facing right).
         strollPhase = .walkingOut
@@ -293,6 +348,8 @@ struct NotchView: View {
         } else {
             replyingTo = session.id
             interaction.isReplying = true
+            // Opening a reply is "reading" this row — clear its attention dot.
+            readState.markRead(session)
             // Compute the "what you're replying to" context ONCE, here, off the
             // render path — `lastAssistantSummary()` reads the transcript file from
             // disk. Fall back to `statusDetail` when the transcript yields nothing.
@@ -318,6 +375,34 @@ struct NotchView: View {
         replyFocused = false
         replyContext = nil
         interaction.isReplying = false
+    }
+
+    /// Cap for the scrollable session list: most of the active screen height, less
+    /// room for the notch, header, reminder banner, and paddings. Clamped so it's
+    /// sane on both a short laptop screen and a tall external display. Beyond this
+    /// the list scrolls internally instead of pushing rows off the screen edge.
+    private var maxListHeight: CGFloat {
+        // Size off the screen that owns the menu bar / physical notch (origin==.zero),
+        // not whichever screen happens to be `.main`, so the cap is right on a
+        // multi-monitor setup where the panel lives on the built-in display.
+        let notchScreen = NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.main
+        let screen = notchScreen?.visibleFrame.height ?? 800
+        return min(max(screen - 260, 240), 760)
+    }
+
+    /// Single source of truth for the resting (non-reply) panel width, shared by the
+    /// panel frame and the pet-stroll travel calc so they can't drift apart.
+    private let restingPanelWidth: CGFloat = 400
+
+    /// DISPLAY names shared by 2+ live sessions — the rows that need a location
+    /// subtitle to be tellable apart (the "find this" case: duplicate names from
+    /// worktrees / multiple checkouts, OR two sessions the user aliased the same).
+    /// Counted by `displayName` (not raw project) so aliasing two siblings to the
+    /// same name still flags the clash and keeps the path·tab subtitle visible.
+    private var clashingDisplayNames: Set<String> {
+        var counts: [String: Int] = [:]
+        for s in store.sessions { counts[Settings.shared.displayName(for: s), default: 0] += 1 }
+        return Set(counts.filter { $0.value > 1 }.map(\.key))
     }
 
     /// Per-status tallies for the non-empty statuses, sorted by `sortRank`
@@ -412,6 +497,13 @@ private struct SessionRow: View {
     /// `statusDetail` fallback), passed down from `NotchView` so it's derived ONCE
     /// when the box opens rather than on every render. Nil when not replying.
     let replyContext: String?
+    /// Whether this row's attention is UNREAD — drives the leading dot. True only
+    /// for a waiting/done session the user hasn't yet dived into or replied to;
+    /// computed by `NotchView` from the shared `AttentionReadState`.
+    let isUnread: Bool
+    /// True when another live session shares this one's project name. Drives the
+    /// location subtitle (path · tab) so duplicate-named sessions are tellable apart.
+    let nameClash: Bool
     /// Shared focus binding owned by `NotchView` — drives keyboard focus into
     /// the inline field. Only one field exists at a time, so one binding is enough.
     @FocusState.Binding var replyFocused: Bool
@@ -422,6 +514,10 @@ private struct SessionRow: View {
     var onSubmitReply: (String) -> Void
     /// Cancel/dismiss the field (Esc, or toggling the ↩ button off).
     var onCancelReply: () -> Void
+    /// Dive straight into this session: front its terminal tab. Same effect as a
+    /// row tap (`onSelect`), surfaced as an explicit ↗ button so it's discoverable
+    /// when you just want to jump in rather than type a reply.
+    var onJump: () -> Void
 
     @State private var hovering = false
     /// Live text for this row's inline reply field.
@@ -437,14 +533,21 @@ private struct SessionRow: View {
     /// while it's 0 we fall back to a sensible non-collapsed height.
     @State private var contextTextHeight: CGFloat = 0
     /// Cap for the REPLYING-TO reading pane; above this it scrolls internally.
-    private let contextMaxHeight: CGFloat = 480
+    /// Kept deliberately SHORT: the panel has no overall height bound and
+    /// DynamicNotchKit sizes it to its content, so a tall reading pane pushes the
+    /// composer (which sits BELOW it) off the bottom of the screen — the user then
+    /// "can't see it and can't reply". 180pt (~9 lines, internally scrollable for
+    /// longer messages) guarantees the composer stays on screen.
+    private let contextMaxHeight: CGFloat = 180
     /// Fallback height before the first measurement lands, so the pane never
     /// renders collapsed to ~2 lines on the first pass.
-    private let contextFallbackHeight: CGFloat = 120
+    private let contextFallbackHeight: CGFloat = 90
 
     private var color: Color { session.status.color }
     private var isWorking: Bool { session.status == .working }
     private var isWaiting: Bool { session.status == .waiting }
+    /// Shown name: the user's alias (by cwd) or the project basename.
+    private var displayName: String { Settings.shared.displayName(for: session) }
 
     var body: some View {
         // While a reply is open on ANOTHER row, this row collapses to a compact,
@@ -466,21 +569,23 @@ private struct SessionRow: View {
         .onHover { hovering = $0 }
     }
 
-    /// Claude-style status pill: status-tinted text on a low-alpha status fill,
-    /// capsule shape, small uppercase tracked label. Shared by full + compact rows.
+    /// Small, secondary status tag — same visual tier as the `ctx` meta, so it
+    /// never crowds out the project name. Status-tinted uppercase micro-label on a
+    /// faint fill; deliberately compact (8pt, tight padding). `fixedSize` keeps it a
+    /// clean single-line pill, but its small footprint means the name wins the row.
     private var statusPill: some View {
         Text(session.status.rawValue)
-            .font(.system(size: 9, weight: .semibold))
+            .font(.system(size: 8, weight: .semibold))
             .textCase(.uppercase)
-            .tracking(0.5)
+            .tracking(0.4)
             .foregroundStyle(color)
             // Single-line guard: the badge must NEVER wrap to one-letter-per-line
             // when the row's left column is compressed. `fixedSize` keeps it at its
             // natural single-line width so it stays a clean pill.
             .lineLimit(1)
             .fixedSize(horizontal: true, vertical: false)
-            .padding(.horizontal, Theme.Space.sm)
-            .padding(.vertical, 2)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1.5)
             .background(color.opacity(0.16), in: Capsule())
     }
 
@@ -510,15 +615,19 @@ private struct SessionRow: View {
 
                 VStack(alignment: .leading, spacing: Theme.Space.xs) {
                     HStack(spacing: Theme.Space.sm) {
-                        Text(session.project)
+                        attentionDot
+
+                        // The name now owns the entire title row — status + model
+                        // moved down to `metaLine`, so the full name shows instead
+                        // of truncating behind the WAITING badge. `displayName` is
+                        // the user alias when set, else the project basename.
+                        Text(displayName)
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(Color.cl.onDark)
                             .lineLimit(1)
-
-                        statusPill
-                        modelLabel
                     }
 
+                    locationSubtitle
                     detailLine
                     metaLine
                 }
@@ -529,7 +638,9 @@ private struct SessionRow: View {
                     .font(.system(size: 10))
                     .foregroundStyle(Color.cl.onDarkSoft)
 
+                jumpButton
                 replyButton
+                overflowMenu
             }
 
             // Row 2 — permission menu. Shown ONLY for a waiting row that is a REAL
@@ -563,12 +674,22 @@ private struct SessionRow: View {
         HStack(spacing: Theme.Space.md) {
             accentBar
 
-            Text(session.project)
+            Text(displayName)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(Color.cl.onDarkSoft)
                 .lineLimit(1)
 
             statusPill
+
+            // When names clash, keep the branch visible even on the dimmed/compact
+            // row so the replied-to session and its sibling stay tellable apart.
+            if nameClash, let branch = session.gitBranch, !branch.isEmpty {
+                Text("⎇ \(branch)")
+                    .font(.system(size: 10, weight: .regular, design: .monospaced))
+                    .foregroundStyle(Color.cl.onDarkSoft)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
 
             modelLabel
 
@@ -680,6 +801,107 @@ private struct SessionRow: View {
         case .primary, .secondary:
             EmptyView()
         }
+    }
+
+    /// Small status-tinted dot pinned to the LEFT of the project name on rows whose
+    /// attention is UNREAD (waiting/done you haven't dived into or replied to yet).
+    /// It's the at-a-glance "this one is new and wants you" signal that pairs with
+    /// the ↗ dive-in button. Waiting dots gently pulse (actively blocked on you);
+    /// done dots are steady. Once you engage the row the dot clears, so the column
+    /// only lights up for what you still owe a look.
+    @ViewBuilder private var attentionDot: some View {
+        if isUnread {
+            if isWaiting {
+                TimelineView(.animation) { timeline in
+                    let t = timeline.date.timeIntervalSinceReferenceDate
+                    let pulse = 0.5 + 0.5 * (0.5 + 0.5 * sin(t * 3))
+                    dotCircle.opacity(pulse)
+                }
+            } else {
+                dotCircle
+            }
+        }
+    }
+
+    private var dotCircle: some View {
+        Circle()
+            .fill(color)
+            .frame(width: 7, height: 7)
+            .shadow(color: color.opacity(0.6), radius: 2)
+    }
+
+    /// Overflow "⋯" menu of per-row quick actions (copy last message / copy path /
+    /// reveal in Finder / open folder / rename). A `Menu` consumes its own clicks so
+    /// it won't trigger the row's tap-to-focus or the ↗/↩ buttons.
+    private var overflowMenu: some View {
+        Menu {
+            zcRowActions(session)
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(hovering ? Color.cl.coral : Color.cl.onDarkSoft)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+    }
+
+    /// One-tap reply snippets above the composer (only while replying). Leads with
+    /// yes/no when Claude's last message looks like a question. A snippet ending in
+    /// "…" pre-fills the field (no send) so you can finish it; otherwise it sends
+    /// immediately via the same proven injection path as Return.
+    @ViewBuilder private var snippetBar: some View {
+        let questionLike = (replyContext?.contains("?") == true)
+        let chips = (questionLike ? ["yes", "no"] : []) + Settings.shared.replySnippets
+        if !chips.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: Theme.Space.xs) {
+                    ForEach(Array(chips.enumerated()), id: \.offset) { _, chip in
+                        Button {
+                            if chip.hasSuffix("…") {
+                                replyText = String(chip.dropLast()).trimmingCharacters(in: .whitespaces) + " "
+                                replyFocused = true
+                            } else {
+                                onSubmitReply(chip)
+                                replyText = ""
+                            }
+                        } label: {
+                            Text(chip)
+                                .font(.system(size: 11))
+                                .foregroundStyle(Color.cl.onDark)
+                                .lineLimit(1)
+                                .padding(.horizontal, Theme.Space.sm)
+                                .padding(.vertical, 4)
+                                .background(
+                                    Capsule()
+                                        .fill(Color.cl.surfaceDarkSoft)
+                                        .overlay(Capsule().strokeBorder(Color.cl.coral.opacity(0.4), lineWidth: 1))
+                                )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+    }
+
+    /// Dive-in affordance: ↗ jumps straight into this session's terminal tab (same
+    /// effect as tapping the row, surfaced explicitly so it's discoverable when you
+    /// just want to switch in rather than reply). A real `Button` consumes its own
+    /// click so it won't double-fire the row's `onTapGesture`. Lights coral on hover.
+    private var jumpButton: some View {
+        Button(action: onJump) {
+            Image(systemName: "arrow.up.forward.app.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(hovering ? Color.cl.coral : Color.cl.onDarkSoft)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Jump to \(session.project) in the terminal")
     }
 
     /// Reply affordance: toggles an INLINE text field inside the notch to inject a
@@ -794,6 +1016,8 @@ private struct SessionRow: View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
             replyContextLine
 
+            snippetBar
+
             // The input area itself sits on the soft inset surface with a coral
             // focus ring (Claude's text-input-focused = coral).
             HStack(alignment: .top, spacing: Theme.Space.sm) {
@@ -804,7 +1028,7 @@ private struct SessionRow: View {
 
                 MultilineReplyField(
                     text: $replyText,
-                    placeholder: "Reply to \(session.project)…",
+                    placeholder: "Reply to \(displayName)…",
                     caretColor: Color.cl.coral,
                     isFocused: $replyFocused,
                     onSend: {
@@ -847,30 +1071,110 @@ private struct SessionRow: View {
         }
     }
 
-    /// Small, muted meta hints beneath the detail line: context-window usage
-    /// (`ctx 42%`) and total session lifetime (`2h14m`), joined with a middot —
-    /// e.g. `ctx 42% · 2h14m`. Context percent shows only when `contextPercent`
-    /// is known; the session time only when `sessionElapsed()` is known; the line
-    /// hides entirely when neither is available. The session time is a LIFETIME
-    /// value (distinct from the live `running <turn>` in `detailLine`); it ticks
-    /// once a second via `TimelineView` so it stays current without depending on
-    /// state-file updates. Monospaced digits keep it from jittering as it ticks.
+    /// Attributes line beneath the detail text: the small status tag, then muted
+    /// mono hints — model (`opus-4-8`), context-window usage (`ctx 42%`), and total
+    /// session lifetime (`2h14m`), joined with a middot — e.g.
+    /// `[WAITING]  opus-4-8 · ctx 42% · 2h14m`. The status tag was MOVED here off the
+    /// title row so the project name owns the full left column instead of being
+    /// truncated behind the badge. The session time is a LIFETIME value (distinct
+    /// from the live `running <turn>` in `detailLine`); it ticks once a second via
+    /// `TimelineView` so it stays current. Monospaced digits keep it from jittering.
     @ViewBuilder private var metaLine: some View {
-        let pct = session.contextPercent
-        if pct != nil || session.startedAt != nil {
-            TimelineView(.periodic(from: .now, by: 1)) { timeline in
-                let parts: [String] = [
-                    pct.map { "ctx \($0)%" },
-                    session.sessionElapsed(asOf: timeline.date),
-                ].compactMap { $0 }
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            let parts: [String] = [
+                session.modelShort,
+                session.contextPercent.map { "ctx \($0)%" },
+                session.sessionElapsed(asOf: timeline.date),
+            ].compactMap { $0 }
+            HStack(spacing: Theme.Space.sm) {
+                statusPill
+                waitingBadge(asOf: timeline.date)
+                branchChip
                 if !parts.isEmpty {
                     Text(parts.joined(separator: " · "))
                         .font(.system(size: 10, weight: .regular, design: .monospaced))
                         .foregroundStyle(Color.cl.onDarkSoft)
                         .lineLimit(1)
+                        .truncationMode(.tail)
                 }
             }
         }
+    }
+
+    /// "Blocked for" badge — `⏱ 17m` — on waiting rows only, whose tint ESCALATES
+    /// with the wait: neutral under 2m, amber past 2m, red past 10m, so a long-
+    /// neglected session draws the eye. Reuses the meta line's 1s tick (no extra
+    /// render cost) and hides on every non-waiting row.
+    @ViewBuilder private func waitingBadge(asOf now: Date) -> some View {
+        if let waited = session.waitElapsed(asOf: now) {
+            let secs = session.waitSeconds(asOf: now) ?? 0
+            let tint: Color = secs > 600 ? .cl.error : (secs > 120 ? .cl.amber : .cl.onDarkSoft)
+            HStack(spacing: 2) {
+                Image(systemName: "clock")
+                    .font(.system(size: 8, weight: .semibold))
+                Text(waited)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(tint)
+            .fixedSize()
+        }
+    }
+
+    /// Small git-branch chip on the meta line — `⎇ main`. The everyday "which
+    /// checkout is this" signal and, with the location subtitle, the worktree
+    /// disambiguator. Hidden for non-git dirs. Truncates tail-first so a long
+    /// branch name never pushes the model/ctx/uptime off the line.
+    @ViewBuilder private var branchChip: some View {
+        if let branch = session.gitBranch, !branch.isEmpty {
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 8, weight: .semibold))
+                Text(branch)
+                    .font(.system(size: 10, weight: .regular, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                // Linked-worktree tag — instantly flags which row is a worktree vs
+                // the main checkout when names collide.
+                if session.isWorktree == true {
+                    Text("WT")
+                        .font(.system(size: 8, weight: .bold))
+                        .tracking(0.3)
+                        .foregroundStyle(Color.cl.teal)
+                        .padding(.horizontal, 3)
+                        .padding(.vertical, 0.5)
+                        .background(Color.cl.teal.opacity(0.16), in: Capsule())
+                }
+            }
+            .foregroundStyle(Color.cl.onDarkSoft)
+            .layoutPriority(0.5)
+        }
+    }
+
+    /// Location subtitle shown ONLY when another live session shares this project
+    /// name (the "find this" case). Home-abbreviated path + a guaranteed-unique tab
+    /// tag, middle-truncated so the head and the project tail both stay visible —
+    /// so two `beyond-young-academy` rows read as e.g. `~/BY-Website · ttys003`
+    /// vs `~/worktrees/by-notch · ttys007`. Normal (non-clashing) rows stay compact.
+    @ViewBuilder private var locationSubtitle: some View {
+        if nameClash, let loc = locationText {
+            HStack(spacing: 4) {
+                Image(systemName: "folder")
+                    .font(.system(size: 8))
+                Text(loc)
+                    .font(.system(size: 10, weight: .regular, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .foregroundStyle(Color.cl.onDarkSoft)
+        }
+    }
+
+    /// The disambiguating location string: home-abbreviated cwd + the tab tag,
+    /// each included only when known. Nil when neither is available.
+    private var locationText: String? {
+        let parts = [session.cwdHome, session.ttyShort].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
     }
 
     /// statusDetail, with a live "· running 2m14s" appended while working.
@@ -884,15 +1188,17 @@ private struct SessionRow: View {
                      : (elapsed.map { "\(detail) · running \($0)" } ?? detail))
                     .font(.system(size: 11))
                     .foregroundStyle(Color.cl.onDarkSoft)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         } else if !detail.isEmpty {
             Text(detail)
                 .font(.system(size: 11))
                 .foregroundStyle(Color.cl.onDarkSoft)
-                .lineLimit(1)
-                .truncationMode(.middle)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
@@ -1100,7 +1406,85 @@ final class NotchReplyTextView: NSTextView {
 /// Reports the natural (wrapped) height of the "↩ REPLYING TO" message `Text`
 /// up the view tree so the reading pane can size itself to `min(content, cap)`
 /// instead of collapsing to a `ScrollView`'s minimal ideal height.
+// MARK: - Row quick actions (shared by the ⋯ overflow menu and the right-click menu)
+
+/// Copy Claude's last assistant message to the clipboard. CRITICAL: this does
+/// synchronous disk IO (now tail-bounded) — only ever call it from a tap action,
+/// never a label/body render path.
+@MainActor private func zcCopyLastMessage(_ s: Session) {
+    let text = s.lastAssistantSummary() ?? s.statusDetail ?? ""
+    guard !text.isEmpty else { return }
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+}
+
+@MainActor private func zcCopyPath(_ s: Session) {
+    guard let cwd = s.cwd, !cwd.isEmpty else { return }
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(cwd, forType: .string)
+}
+
+@MainActor private func zcRevealInFinder(_ s: Session) {
+    guard let cwd = s.cwd, !cwd.isEmpty else { return }
+    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: cwd)])
+}
+
+/// Open the session's folder in the user's default handler for directories (e.g.
+/// Finder, or an editor set as the folder handler). NOT routed through
+/// FocusController.focusEditor (that only RAISES an already-open editor by title).
+@MainActor private func zcOpenFolder(_ s: Session) {
+    guard let cwd = s.cwd, !cwd.isEmpty else { return }
+    NSWorkspace.shared.open(URL(fileURLWithPath: cwd))
+}
+
+/// Modal rename: set or clear the per-cwd alias. Uses an NSAlert with a text field
+/// (SwiftUI menus can't host one) and activates the app so the field is focusable.
+@MainActor private func zcPromptRename(_ s: Session) {
+    guard let cwd = s.cwd, !cwd.isEmpty else { return }
+    let alert = NSAlert()
+    alert.messageText = "Rename session"
+    alert.informativeText = "Shown instead of “\(s.project)”. Leave blank to use the default."
+    alert.addButton(withTitle: "Save")
+    alert.addButton(withTitle: "Cancel")
+    let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+    field.stringValue = Settings.shared.alias(forCwd: cwd) ?? ""
+    field.placeholderString = s.project
+    alert.accessoryView = field
+    // Do NOT NSApp.activate here: this is an .accessory app, so activating it would
+    // permanently pull frontmost off the terminal (it never auto-deactivates when
+    // the modal closes). runModal() makes the alert window key on its own, so the
+    // field still accepts input while the terminal keeps frontmost on dismiss.
+    alert.window.makeKeyAndOrderFront(nil)
+    if alert.runModal() == .alertFirstButtonReturn {
+        Settings.shared.setAlias(field.stringValue, forCwd: cwd)
+    }
+}
+
+/// The shared action set, rendered in both the ⋯ overflow Menu and the row's
+/// right-click contextMenu so they never drift.
+@ViewBuilder @MainActor private func zcRowActions(_ s: Session) -> some View {
+    Button { zcCopyLastMessage(s) } label: { Label("Copy last message", systemImage: "doc.on.doc") }
+    Button { zcCopyPath(s) } label: { Label("Copy path", systemImage: "folder") }
+    Button { zcRevealInFinder(s) } label: { Label("Reveal in Finder", systemImage: "macwindow") }
+    Button { zcOpenFolder(s) } label: { Label("Open folder", systemImage: "arrow.up.forward.app") }
+    Divider()
+    Button { zcPromptRename(s) } label: {
+        Label(Settings.shared.alias(forCwd: s.cwd) == nil ? "Rename…" : "Rename / clear name…",
+              systemImage: "pencil")
+    }
+}
+
 private struct ReplyContextHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// Reports the session list's natural content height so the surrounding ScrollView
+/// can size to content (short list → panel hugs it) and cap + scroll only when it
+/// would overflow the screen.
+private struct SessionListHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())

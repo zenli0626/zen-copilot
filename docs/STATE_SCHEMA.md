@@ -24,6 +24,10 @@ Claude Code hooks (the writer). Do not diverge from it without updating this fil
   "sessionId": "a1b2c3d4-...",        // Claude Code session_id (from hook stdin)
   "project": "web-app",                // basename of cwd
   "cwd": "/Users/you/Projects/web-app",
+  "gitBranch": "main",                  // current branch of cwd (or "@<short-sha>" detached); absent for non-git dirs. Disambiguates same-named sessions / worktrees.
+  "isWorktree": false,                  // true when cwd is a LINKED git worktree (not the main checkout); absent for non-git dirs
+  "gitRepoRoot": "/Users/you/Projects/web-app",  // absolute working-tree toplevel (distinct per worktree); absent for non-git dirs
+  "repoName": "web-app",                // STABLE shared-repo name (same for every worktree of one repo); absent for non-git dirs
   "status": "working",                 // see Status enum below
   "statusDetail": "Edit src/App.tsx",  // short human label, optional
   "tty": "/dev/ttys003",               // controlling terminal, for click-to-focus; may be null
@@ -31,6 +35,7 @@ Claude Code hooks (the writer). Do not diverge from it without updating this fil
   "termProgram": "Apple_Terminal",     // $TERM_PROGRAM: picks the focus dialect (Apple_Terminal | iTerm.app | vscode | …); may be null
   "model": "Opus 4.6",                  // optional, best-effort
   "startedAt": "2026-05-28T17:45:00Z",  // ISO8601 UTC
+  "enteredStatusAt": null,              // when the session entered `waiting` (stamped on the transition); null otherwise. Drives "blocked for 17m" + oldest-waiting-first triage.
   "updatedAt": "2026-05-28T17:46:12Z",  // ISO8601 UTC, bumped every event
   "lastEvent": "PreToolUse",            // raw hook_event_name that produced this state
 
@@ -78,11 +83,17 @@ constructable from the hook payload alone.
 | `SessionStart`         | `idle`           | create file; capture tty, termSessionId, project, model, startedAt |
 | `UserPromptSubmit`     | `working`        | statusDetail = "thinking…"                        |
 | `PreToolUse`           | `working`        | statusDetail = "<ToolName> <short target>"        |
-| `PostToolUse`          | `working`        | keep working; statusDetail = "ran <ToolName>"     |
-| `Notification`         | `waiting`        | statusDetail = the notification message (this is when Claude needs permission or has been idle) |
-| `Stop`                 | `done`           | statusDetail = "finished" — app fires a notification on this transition |
+| `PostToolUse`          | `working` OR `error` | `error` ("<Tool> failed") when `tool_response.is_error == true`; else "ran <ToolName>" |
+| `Notification`         | `waiting` OR `error` | `waiting` normally (permission or idle); `error` when the message is error-shaped and not a permission prompt |
+| `Stop`                 | `done`           | statusDetail = "finished" — app fires a notification on this transition. NEVER produces `error`. |
 | `SubagentStop`         | (unchanged)      | leave parent status as `working`; optionally bump updatedAt |
 | `SessionEnd`           | (delete file)    | remove `<session_id>.json`                        |
+
+**Git topology** (`gitBranch` / `isWorktree` / `gitRepoRoot` / `repoName`) is recomputed
+from a single defensive `git rev-parse` (1s timeout) ONLY on `SessionStart` and
+`UserPromptSubmit` — not every tool call — and is left untouched (not nulled) on a
+transient git failure. `repoName` is the basename of the dir holding the COMMON `.git`,
+so all worktrees of one repo share it; `gitRepoRoot` differs per worktree.
 
 Every event MUST update `updatedAt`. `status` only changes per the table above.
 `startedAt` is written once and never overwritten. `tty`, `termSessionId`, and

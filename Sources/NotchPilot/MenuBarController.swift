@@ -113,7 +113,14 @@ final class MenuBarController: NSObject {
     }
 
     private func menuTitle(for session: Session) -> String {
-        "\(session.project) — \(session.status.rawValue) — \(session.relativeUpdated)"
+        let name = Settings.shared.displayName(for: session)
+        let branch = session.gitBranch.map { "  ⎇ \($0)" } ?? ""
+        // When another live session resolves to the SAME display name (two tabs in
+        // one dir, or two sessions aliased alike), append the tab tag so the menu
+        // bar — which has no location subtitle — still tells them apart.
+        let dupName = store.sessions.filter { Settings.shared.displayName(for: $0) == name }.count > 1
+        let tab = (dupName ? session.ttyShort.map { "  ·  \($0)" } : nil) ?? ""
+        return "\(name)\(branch)\(tab) — \(session.status.rawValue) — \(session.relativeUpdated)"
     }
 
     /// Small colored dot rendered as an NSImage for the menu item.

@@ -37,11 +37,72 @@ NOTCHPILOT_TTY_RAW="$TTY_RAW" \
 NOTCHPILOT_TERM_SESSION_ID="${TERM_SESSION_ID:-}" \
 NOTCHPILOT_TERM_PROGRAM="${TERM_PROGRAM:-}" \
 python3 <<'PYEOF' 2>/dev/null
-import os, sys, json, datetime
+import os, sys, json, datetime, subprocess
 
 def now_iso():
     # ISO8601 UTC, e.g. 2026-05-28T17:46:12.123456+00:00
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+def git_topology(cwd):
+    """Single-process git topology for cwd. Returns a dict (possibly empty) with any
+    of: gitBranch (or "@<short-sha>" detached), isWorktree (bool), gitRepoRoot, and
+    repoName — the STABLE shared-repo key (same for every worktree of one repo, so
+    two worktrees disambiguate by branch/path but group by repoName). DEFENSIVE: a
+    single git call with a 1s timeout, never raises, never blocks Claude Code."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--path-format=absolute",
+             "--git-common-dir", "--git-dir", "--show-toplevel", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=1.0)
+        if out.returncode != 0:
+            return {}
+        lines = (out.stdout or "").splitlines()
+        if len(lines) < 4:
+            return {}
+        common_dir, git_dir, toplevel, branch = lines[0], lines[1], lines[2], lines[3]
+        # Guard against git older than 2.31: it doesn't understand
+        # --path-format=absolute, echoes the token to stdout (rc=0) and emits
+        # RELATIVE git-dir paths, which would slip past the rc/len guards and
+        # persist garbage (branch='/path', spurious WT, one bogus repoName group).
+        # Modern git always emits absolute paths here; old git → bail, keep priors.
+        if not (os.path.isabs(common_dir) and os.path.isabs(git_dir)):
+            return {}
+        topo = {}
+        # A LINKED worktree's per-worktree git_dir (…/.git/worktrees/<name>) differs
+        # from the shared common_dir (…/.git); for the main checkout they're equal.
+        topo["isWorktree"] = os.path.normpath(common_dir) != os.path.normpath(git_dir)
+        if toplevel:
+            topo["gitRepoRoot"] = toplevel
+        # Stable shared-repo name = basename of the dir CONTAINING the common .git
+        # (NOT basename(toplevel), which differs per worktree).
+        cd = common_dir.rstrip("/")
+        if os.path.basename(cd) == ".git":
+            cd = os.path.dirname(cd)
+        repo = os.path.basename(cd.rstrip("/"))
+        if repo:
+            topo["repoName"] = repo
+        if branch == "HEAD":
+            sha = subprocess.run(
+                ["git", "-C", cwd, "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=1.0)
+            s = (sha.stdout or "").strip()
+            if sha.returncode == 0 and s:
+                topo["gitBranch"] = "@" + s
+        elif branch:
+            topo["gitBranch"] = branch
+        return topo
+    except Exception:
+        return {}
+
+def tool_errored(d):
+    """True when a PostToolUse payload's tool_response signals failure. Keyed on the
+    RELIABLE `is_error` flag only (avoids false positives from Bash output that merely
+    contains the word 'error'). Never raises."""
+    try:
+        tr = d.get("tool_response")
+        return isinstance(tr, dict) and tr.get("is_error") is True
+    except Exception:
+        return False
 
 try:
     raw = os.environ.get("NOTCHPILOT_STDIN", "") or ""
@@ -90,6 +151,16 @@ try:
     if cwd:
         state["cwd"] = cwd
         state.setdefault("project", os.path.basename(cwd.rstrip("/")) or cwd)
+        # git topology (DEFENSIVE) — branch / worktree flag / repo root / stable repo
+        # name, the disambiguators for same-named sessions and worktrees. Recomputed
+        # only on the CHEAP events (not every tool call) since it shells to git; a
+        # transient git failure leaves prior values rather than clobbering them.
+        if event in ("SessionStart", "UserPromptSubmit"):
+            topo = git_topology(cwd)
+            for k in ("gitBranch", "isWorktree", "gitRepoRoot", "repoName"):
+                v = topo.get(k)
+                if v is not None:
+                    state[k] = v
     state.setdefault("project", state.get("project"))
     state.setdefault("status", "idle")
     state.setdefault("statusDetail", None)
@@ -99,6 +170,7 @@ try:
     state.setdefault("model", None)
     state.setdefault("startedAt", None)
     state.setdefault("turnStartedAt", None)
+    state.setdefault("enteredStatusAt", None)
     state.setdefault("contextTokens", None)
 
     # --- Subagent / parent-child linkage (DEFENSIVE, optional) -----------------
@@ -256,10 +328,16 @@ try:
         state["statusDetail"] = (tool_name + " " + tgt).strip() if tgt else tool_name
 
     elif event == "PostToolUse":
-        state["status"] = "working"
         state["needsPermission"] = False
         tool_name = data.get("tool_name") or "tool"
-        state["statusDetail"] = "ran " + tool_name
+        if tool_errored(data):
+            # A tool returned is_error → surface it: errors are easy to miss in a
+            # scrolling terminal but are exactly when the human is needed.
+            state["status"] = "error"
+            state["statusDetail"] = tool_name + " failed"
+        else:
+            state["status"] = "working"
+            state["statusDetail"] = "ran " + tool_name
 
     elif event == "Notification":
         state["status"] = "waiting"
@@ -278,6 +356,15 @@ try:
             state["statusDetail"] = (msg[:80] + "…") if len(msg) > 80 else msg
         else:
             state["statusDetail"] = "waiting for input"
+        # An error-shaped notification that is NOT a permission prompt → error.
+        # Guard against negated/benign mentions ("no errors", "0 errors",
+        # "succeeded") so they don't wrongly escalate to red + Basso.
+        low = msg.lower() if isinstance(msg, str) else ""
+        low_has_err = ("error" in low or "failed" in low) and not any(
+            p in low for p in ("no error", "0 error", "without error", "succeeded", "no failures")
+        )
+        if not state["needsPermission"] and low_has_err:
+            state["status"] = "error"
 
     elif event == "Stop":
         state["status"] = "done"
@@ -305,6 +392,15 @@ try:
             state["turnStartedAt"] = now_iso()
     else:
         state["turnStartedAt"] = None
+
+    # Track when the session ENTERED waiting (for "blocked for 17m" + oldest-first
+    # triage). Stamp on the transition into waiting only — a second Notification
+    # mid-wait must NOT reset it — and clear once it leaves waiting.
+    if state.get("status") == "waiting":
+        if prev_status != "waiting" or not state.get("enteredStatusAt"):
+            state["enteredStatusAt"] = now_iso()
+    else:
+        state["enteredStatusAt"] = None
 
     # Always bump updatedAt + record raw event.
     state["updatedAt"] = now_iso()
